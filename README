@@ -1,1 +1,60 @@
 DQN poker project
+
+
+Can edit later
+
+TODO
+
+ Data Prep
+
+ Parse hand histories → unified state format
+
+ Extract features: cards, pot, position, stacks
+
+ Compute opponent stats (VPIP, PFR, AF, WWSF…)
+
+ Add tilt / streak features
+
+ Supervised Pretraining (Behavior Cloning)
+
+ Train policy net on human actions
+
+ Save π_human(s)
+
+ DQN Architecture
+
+ Shared encoder (MLP/LSTM)
+
+ Dueling Double DQN head
+
+ Optional LSTM for DRQN
+
+ Trait head (predict archetype)
+
+ RL Training
+
+ Replay buffer + PER
+
+ Action masking
+
+ Reward = chips + α·log π_human(a|s)
+
+ Opponent embeddings input
+
+ Evaluation
+
+ Compare to human stats (VPIP, PFR, bluff %)
+
+ KL(policy, human) on held-out data
+
+ Winrate vs baseline bots & clones
+
+ Artifacts
+
+ Training script
+
+ Inference script
+
+ Configs (hyperparams)
+
+ Plots: KL, winrate, stats drift
