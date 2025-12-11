@@ -61,6 +61,9 @@ class PokerEnvironment:
     def reset(self):    
         self.deck = self._create_deck()
         self.stacks = [self.initial_stack] * self.num_players
+        # >>> CHANGED: track starting stacks for net-change rewards
+        self.starting_stacks = self.stacks.copy()
+        # <<<
         self.pot = 0
         self.community_cards = []
         self.player_cards = [[] for _ in range(self.num_players)]
@@ -191,7 +194,7 @@ class PokerEnvironment:
     
     def step(self, player_idx, action_type, amount=0):
         if self.hand_over:
-            return self.get_state(player_idx), 0, True, {}
+            return self.get_state(player_idx), 0.0, True, {'pot': self.pot, 'stack': self.stacks[player_idx]}
         
         valid_actions = self.get_valid_actions(player_idx)
         action_map = {a[0]: a for a in valid_actions}
@@ -201,12 +204,14 @@ class PokerEnvironment:
         
         action_type, amount = action_map[action_type]
         
-        reward = 0
         done = False
         
         if action_type == 'fold':
+            # Fold = end of hand, opponent wins pot
+            opponent = (player_idx + 1) % self.num_players
+            self.stacks[opponent] += self.pot
+            self.pot = 0
             self.hand_over = True
-            reward = -self.bets_this_round[player_idx]
             done = True
         elif action_type == 'call':
             call_amount = min(amount, self.stacks[player_idx])
@@ -221,36 +226,176 @@ class PokerEnvironment:
             self.pot += raise_amount
             self.current_bet = self.bets_this_round[player_idx]
         
-        self.action_history.append((player_idx, 0 if action_type == 'fold' else (1 if action_type == 'call' else 2), amount))
+        self.action_history.append(
+            (player_idx, 0 if action_type == 'fold' else (1 if action_type == 'call' else 2), amount)
+        )
         
-        if all(self.bets_this_round[i] == self.current_bet or self.stacks[i] == 0 
-               for i in range(self.num_players) if not self.hand_over):
-            if self.street == 'preflop':
-                self.street = 'flop'
-                self.community_cards = [self.deck.pop() for _ in range(3)]
-                self.bets_this_round = [0] * self.num_players
-                self.current_bet = 0
-            elif self.street == 'flop':
-                self.street = 'turn'
+        # Check if someone is all-in - go straight to showdown
+        all_in_players = [i for i in range(self.num_players) if self.stacks[i] == 0]
+        if len(all_in_players) > 0 and not self.hand_over:
+            # Run out remaining community cards
+            while len(self.community_cards) < 5:
                 self.community_cards.append(self.deck.pop())
-                self.bets_this_round = [0] * self.num_players
-                self.current_bet = 0
-            elif self.street == 'turn':
-                self.street = 'river'
-                self.community_cards.append(self.deck.pop())
-                self.bets_this_round = [0] * self.num_players
-                self.current_bet = 0
-            else:  # river
-                winner = random.randint(0, self.num_players - 1)
-                if winner == player_idx:
-                    reward += self.pot
-                self.hand_over = True
-                done = True
+            # Showdown - determine winner
+            winner = self._determine_winner()
+            self.stacks[winner] += self.pot
+            self.pot = 0
+            self.hand_over = True
+            done = True
+        elif not self.hand_over:
+            # Simulate opponent action (simple strategy)
+            self._simulate_opponent_action(player_idx)
+            
+            # Check for street transitions after both players have acted
+            if self._betting_round_complete():
+                if self.street == 'preflop':
+                    self.street = 'flop'
+                    self.community_cards = [self.deck.pop() for _ in range(3)]
+                    self.bets_this_round = [0] * self.num_players
+                    self.current_bet = 0
+                elif self.street == 'flop':
+                    self.street = 'turn'
+                    self.community_cards.append(self.deck.pop())
+                    self.bets_this_round = [0] * self.num_players
+                    self.current_bet = 0
+                elif self.street == 'turn':
+                    self.street = 'river'
+                    self.community_cards.append(self.deck.pop())
+                    self.bets_this_round = [0] * self.num_players
+                    self.current_bet = 0
+                else:  # river complete
+                    winner = self._determine_winner()
+                    self.stacks[winner] += self.pot
+                    self.pot = 0
+                    self.hand_over = True
+                    done = True
+        
+        # Reward is net chip change vs starting stack, only when hand ends
+        if self.hand_over:
+            reward = float(self.stacks[player_idx] - self.starting_stacks[player_idx])
+        else:
+            reward = 0.0
         
         next_state = self.get_state(player_idx)
         info = {'pot': self.pot, 'stack': self.stacks[player_idx]}
         
         return next_state, reward, done, info
+    
+    def _simulate_opponent_action(self, hero_idx):
+        """Simulate a simple opponent strategy."""
+        opp_idx = (hero_idx + 1) % self.num_players
+        if self.stacks[opp_idx] == 0:
+            return  # Opponent is all-in
+        
+        to_call = self.current_bet - self.bets_this_round[opp_idx]
+        
+        # Simple opponent strategy based on pot odds and randomness
+        if to_call == 0:
+            # Check or small bet
+            if random.random() < 0.3 and self.stacks[opp_idx] > self.big_blind:
+                bet_amt = min(self.big_blind * 2, self.stacks[opp_idx])
+                self.stacks[opp_idx] -= bet_amt
+                self.bets_this_round[opp_idx] += bet_amt
+                self.pot += bet_amt
+                self.current_bet = self.bets_this_round[opp_idx]
+            # else check (do nothing)
+        elif to_call <= self.stacks[opp_idx]:
+            # Decide to call, raise, or fold
+            pot_odds = to_call / (self.pot + to_call) if self.pot > 0 else 0.5
+            
+            if pot_odds > 0.4 and random.random() < 0.3:
+                # Fold against big bets sometimes
+                self.stacks[hero_idx] += self.pot
+                self.pot = 0
+                self.hand_over = True
+            else:
+                # Call
+                call_amt = min(to_call, self.stacks[opp_idx])
+                self.stacks[opp_idx] -= call_amt
+                self.bets_this_round[opp_idx] += call_amt
+                self.pot += call_amt
+        else:
+            # Can't afford to call - fold
+            self.stacks[hero_idx] += self.pot
+            self.pot = 0
+            self.hand_over = True
+    
+    def _betting_round_complete(self):
+        """Check if the betting round is complete."""
+        if self.hand_over:
+            return False
+        # All players have matched the current bet or are all-in
+        for i in range(self.num_players):
+            if self.stacks[i] > 0 and self.bets_this_round[i] < self.current_bet:
+                return False
+        # Need at least one action in the round (not just blinds)
+        return len(self.action_history) > 0
+    
+    def _determine_winner(self):
+        """Determine the winner based on hand strength (simplified)."""
+        best_player = 0
+        best_strength = -1
+        
+        for p in range(self.num_players):
+            strength = self._evaluate_hand(self.player_cards[p], self.community_cards)
+            if strength > best_strength:
+                best_strength = strength
+                best_player = p
+        
+        return best_player
+    
+    def _evaluate_hand(self, hole_cards, community_cards):
+        """Evaluate hand strength (simplified scoring)."""
+        all_cards = hole_cards + community_cards
+        if len(all_cards) < 5:
+            return random.random()  # Not enough cards, random
+        
+        rank_counts = defaultdict(int)
+        suit_counts = defaultdict(int)
+        ranks = []
+        
+        for r, s in all_cards:
+            rank_counts[r] += 1
+            suit_counts[s] += 1
+            ranks.append(self.rank_to_val.get(r, 0))
+        
+        # Count hand types
+        pairs = sum(1 for c in rank_counts.values() if c == 2)
+        trips = sum(1 for c in rank_counts.values() if c == 3)
+        quads = sum(1 for c in rank_counts.values() if c == 4)
+        flush = max(suit_counts.values()) >= 5
+        
+        # Check for straight
+        unique_ranks = sorted(set(ranks))
+        straight = False
+        for i in range(len(unique_ranks) - 4):
+            if unique_ranks[i+4] - unique_ranks[i] == 4:
+                straight = True
+                break
+        # Wheel (A-2-3-4-5)
+        if set([0, 1, 2, 3, 12]).issubset(set(ranks)):
+            straight = True
+        
+        # Score the hand
+        high_card = max(ranks)
+        score = high_card / 100.0  # Base score from high card
+        
+        if quads:
+            score += 7.0
+        elif trips and pairs:  # Full house
+            score += 6.0
+        elif flush:
+            score += 5.0
+        elif straight:
+            score += 4.0
+        elif trips:
+            score += 3.0
+        elif pairs >= 2:
+            score += 2.0
+        elif pairs == 1:
+            score += 1.0
+        
+        return score
 
 
 class PrioritizedReplayBuffer:
@@ -378,15 +523,15 @@ class PokerTrainer:
         action_mask = torch.zeros(self.config.action_dim).to(self.device)
         
         action_map = {}
-        for i, (action_type, _) in enumerate(valid_actions):
+        for i, (action_type, amt) in enumerate(valid_actions):
             if action_type == 'fold':
                 action_map[0] = (action_type, 0)
                 action_mask[0] = 1
             elif action_type == 'call':
-                action_map[1] = (action_type, _)
+                action_map[1] = (action_type, amt)
                 action_mask[1] = 1
             elif action_type == 'raise':
-                action_map[2] = (action_type, _)
+                action_map[2] = (action_type, amt)
                 action_mask[2] = 1
         
         if training and random.random() < self.epsilon:
@@ -584,7 +729,7 @@ class PokerTrainer:
             state = self.env.reset()
             done = False
             hand_actions = []
-            hand_reward = 0
+            hand_reward = 0.0
             max_steps = 50
             step_count = 0
             while not done and step_count < max_steps:
@@ -594,21 +739,30 @@ class PokerTrainer:
                 state, reward, done, _ = self.env.step(0, action_type, amount)
                 hand_reward += reward
                 step_count += 1
-                if done and reward > 0:
-                    wins += 1
+            
+            # >>> CHANGED: win if net hand profit > 0
+            if hand_reward > 0:
+                wins += 1
+            # <<<
             
             eval_actions.extend(hand_actions)
             eval_rewards.append(hand_reward)
         
-        winrate = wins / total_hands
+        winrate = wins / total_hands if total_hands > 0 else 0.0
         
         agent_stats = self.compute_stats(eval_states[:len(eval_actions)], eval_actions)
         
         kl_div = self.compute_kl_divergence(eval_states[:100])  # Sample for efficiency
         
+        avg_reward = np.mean(eval_rewards) if eval_rewards else 0.0
+        # >>> CHANGED: report BB/100 as well
+        bb_per_100 = (avg_reward / self.env.big_blind) * 100.0 if self.env.big_blind > 0 else 0.0
+        # <<<
+        
         print(f"\n=== Evaluation Results ===")
         print(f"Winrate: {winrate:.2%}")
-        print(f"Avg Reward: {np.mean(eval_rewards):.2f}")
+        print(f"Avg Reward (chips/hand): {avg_reward:.2f}")
+        print(f"BB/100: {bb_per_100:.2f}")
         if kl_div is not None:
             print(f"KL Divergence (human || agent): {kl_div:.4f}")
         print(f"Agent Stats:")
@@ -622,7 +776,8 @@ class PokerTrainer:
         self.dqn_model.train()
         return {
             'winrate': winrate,
-            'avg_reward': np.mean(eval_rewards),
+            'avg_reward': avg_reward,
+            'bb_per_100': bb_per_100,
             'kl_divergence': kl_div,
             'stats': agent_stats
         }
@@ -666,7 +821,7 @@ class PokerTrainer:
         print(f"Models saved to {path}")
     
     def load(self, path):
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.dqn_model.load_state_dict(checkpoint['dqn_model'])
         self.bc_model.load_state_dict(checkpoint['bc_model'])
         self.step_count = checkpoint.get('step_count', 0)
@@ -678,4 +833,3 @@ if __name__ == "__main__":
     trainer = PokerTrainer(config)
     trainer.train()
     trainer.save("poker_dqn_checkpoint.pt")
-
